@@ -30,17 +30,20 @@ async function fixture(t, { raw, mode = 'tui', hasUI = true } = {}) {
   };
   if (raw !== undefined) put(raw);
   const harness = () => {
-    const handlers = new Map(), commands = new Map(), notices = [];
+    const handlers = new Map(), commands = new Map(), notices = [], statuses = new Map();
     const ctx = {
       mode, hasUI, model: { ...supportedModel },
-      ui: { notify: (message, level) => notices.push({ message, level }) },
+      ui: {
+        notify: (message, level) => notices.push({ message, level }),
+        setStatus: (key, text) => text === undefined ? statuses.delete(key) : statuses.set(key, text),
+      },
     };
     extension.default({
       on: (event, handler) => handlers.set(event, handler),
       registerCommand: (name, command) => commands.set(name, command),
     });
     return {
-      ctx, notices, handlers, commands,
+      ctx, notices, handlers, commands, statuses,
       start: () => handlers.get('session_start')({}, ctx),
       request: payload => handlers.get('before_provider_request')({ payload }, ctx),
       command: args => commands.get('fast').handler(args, ctx),
@@ -54,31 +57,47 @@ const last = h => h.notices.at(-1);
 const assertOff = h => assert.equal(h.request(Object.freeze({ input: [] })), undefined);
 const assertOn = h => assert.deepEqual(h.request({}), { service_tier: 'priority' });
 
-test('whitelist exactly preserves the original provider/model boundaries', async t => {
+test('only openai-codex is eligible, regardless of model ID or family', async t => {
   const { extension, h } = await fixture(t, { raw: '{"enabled":true}' });
   h.start();
-  const accepted = ['gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-5.6-codex', 'gpt-5.6-mini', 'gpt-5.6-2026-06-01'];
-  const rejected = [undefined, '', 'gpt-5', 'gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.4-codex',
-    'gpt-5.5-mini', 'gpt-5.5-codex', 'gpt-5.60', 'gpt-5.6mini', 'gpt-5.6.preview',
-    'gpt-5.7', 'GPT-5.6', ' gpt-5.6', 'o3'];
-  for (const id of accepted) {
-    assert.equal(extension.supportsCodexFast('openai-codex', id), true, id);
+  // Include unknown/future names and no ID to prove there is no model gate.
+  const ids = ['gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.4-mini',
+    'gpt-5.5-codex', 'gpt-future', 'future-model', 'codex-auto-review', 'o3', '', undefined];
+  assert.equal(extension.supportsCodexFast('openai-codex'), true);
+  for (const id of ids) {
     h.ctx.model = { provider: 'openai-codex', id };
     assertOn(h);
   }
-  for (const id of rejected) {
-    assert.equal(extension.supportsCodexFast('openai-codex', id), false, String(id));
-    h.ctx.model = { provider: 'openai-codex', id };
-    assertOff(h);
-  }
-  for (const provider of [undefined, '', 'openai', 'azure-openai', 'OpenAI-Codex', 'custom']) {
-    for (const id of accepted) {
-      assert.equal(extension.supportsCodexFast(provider, id), false);
+  for (const provider of [undefined, '', 'openai', 'azure-openai', 'OpenAI-Codex',
+    'openai-codex-proxy', ' openai-codex', 'custom', 'anthropic']) {
+    assert.equal(extension.supportsCodexFast(provider), false);
+    for (const id of ids) {
       h.ctx.model = { provider, id };
       assertOff(h);
     }
   }
   h.ctx.model = undefined;
+  assertOff(h);
+});
+
+test('provider switches update both the request gate and status without a reload', async t => {
+  const { h } = await fixture(t, { raw: '{"enabled":true}' });
+  h.start();
+  for (const provider of ['openai-codex', 'openai', 'openai-codex', 'custom']) {
+    h.ctx.model = { provider, id: 'previously-unknown-model' };
+    await h.command('status');
+    if (provider === 'openai-codex') {
+      assertOn(h);
+      assert.match(last(h).message, /priority requested for the current model/);
+      assert.match(last(h).message, /no model restrictions/);
+    } else {
+      assertOff(h);
+      assert.match(last(h).message, /current provider is not openai-codex/);
+    }
+    assert.match(last(h).message, /Server acceptance is not guaranteed/);
+  }
+  h.ctx.model = { provider: 'openai-codex', id: 'previously-unknown-model' };
+  await h.command('off');
   assertOff(h);
 });
 
@@ -110,7 +129,7 @@ test('non-object and array payloads are safe and passed through unchanged', asyn
 
 test('factory is side-effect free, starts off, and registers only command and lifecycle/request hooks', async t => {
   const { agentDir, h } = await fixture(t);
-  assert.deepEqual([...h.handlers.keys()], ['session_start', 'before_provider_request']);
+  assert.deepEqual([...h.handlers.keys()], ['session_start', 'model_select', 'session_shutdown', 'before_provider_request']);
   assert.deepEqual([...h.commands.keys()], ['fast']);
   assertOff(h);
   assert.equal(existsSync(agentDir), false);
@@ -202,7 +221,7 @@ test('explicit commands repair malformed config and persist even when state is u
   await h.command('off');
   await h.command('status');
   assert.match(last(h).message, /Codex Fast: off/);
-  assert.match(last(h).message, /current model supports priority requests/);
+  assert.match(last(h).message, /current provider is openai-codex; no model restrictions/);
 });
 
 test('new runtime and session_start reload persisted state; missing config resets to off', async t => {
@@ -240,6 +259,7 @@ test('failed atomic rename reports an error, cleans temporary files, and retains
     assert.equal(h.notices.length, 1);
     assert.equal(last(h).level, 'error');
     assert.ok(last(h).message.includes(path));
+    assert.equal(h.statuses.get('codex-fast'), enabled ? 'fast' : undefined);
     assert.match(last(h).message, new RegExp(`remains ${enabled ? 'on' : 'off'}`));
     assert.deepEqual(readdirSync(agentDir), ['codex-fast.json']);
     assert.equal(readFileSync(join(path, 'sentinel'), 'utf8'), 'must survive');
@@ -267,11 +287,11 @@ test('status, empty args and invalid commands never write; status reflects the c
   }
   h.ctx.model = { provider: 'openai', id: 'gpt-5.6' };
   await h.command('status');
-  assert.match(last(h).message, /not supported; no priority requested/);
+  assert.match(last(h).message, /current provider is not openai-codex; no priority requested/);
   assertOff(h);
   h.ctx.model = undefined;
   await h.command('status');
-  assert.match(last(h).message, /not supported/);
+  assert.match(last(h).message, /current provider is not openai-codex/);
   for (const args of ['toggle', 'on off', 'status extra', 'true']) {
     await h.command(args);
     assert.equal(last(h).level, 'warning');
@@ -308,6 +328,82 @@ test('no old UI migration, dependency, or config write occurs', async t => {
   assert.deepEqual(readdirSync(agentDir).sort(), ['codex-fast.json', 'open-tui.json']);
 });
 
+test('Fast status follows commands, provider switches, invalid reloads and shutdown', async t => {
+  const { h, put } = await fixture(t, { raw: '{"enabled":true}' });
+  h.start();
+  assert.equal(h.statuses.get('codex-fast'), 'fast');
+  h.ctx.model = { provider: 'openai', id: 'any-model' };
+  h.handlers.get('model_select')({}, h.ctx);
+  assert.equal(h.statuses.has('codex-fast'), false);
+  h.ctx.model = { provider: 'openai-codex', id: 'any-future-model' };
+  h.handlers.get('model_select')({}, h.ctx);
+  assert.equal(h.statuses.get('codex-fast'), 'fast');
+  await h.command('off');
+  assert.equal(h.statuses.has('codex-fast'), false);
+  await h.command('on');
+  assert.equal(h.statuses.get('codex-fast'), 'fast');
+  put('{');
+  h.start();
+  assert.equal(h.statuses.has('codex-fast'), false);
+  await h.command('on');
+  h.handlers.get('session_shutdown')({}, h.ctx);
+  assert.equal(h.statuses.has('codex-fast'), false);
+});
+
+test('Fast and local footer integrate in either startup order with live updates', async t => {
+  const footer = await createJiti(import.meta.url).import('../extensions/local-footer.ts');
+  for (const fastFirst of [true, false]) {
+    const { h, root, path } = await fixture(t, { raw: '{"enabled":true}' });
+    h.ctx.cwd = root;
+    h.ctx.model = { provider: 'openai-codex', id: 'future-model', reasoning: true, contextWindow: 1000000 };
+    h.ctx.getContextUsage = () => ({ tokens: 100000, contextWindow: 1000000 });
+    let component, renders = 0;
+    const footerHandlers = new Map();
+    const setStatus = h.ctx.ui.setStatus;
+    h.ctx.ui.setStatus = (key, text) => { setStatus(key, text); renders++; };
+    h.ctx.ui.setFooter = factory => {
+      component?.dispose();
+      component = factory({ requestRender: () => renders++ }, {
+        fg: (_color, text) => text, getThinkingBorderColor: () => text => text,
+      }, { onBranchChange: () => () => {}, getExtensionStatuses: () => h.statuses });
+    };
+    footer.default({ on: (name, handler) => footerHandlers.set(name, handler), getThinkingLevel: () => 'high' });
+    const fire = name => {
+      for (const handlers of fastFirst ? [h.handlers, footerHandlers] : [footerHandlers, h.handlers]) {
+        handlers.get(name)?.({}, h.ctx);
+      }
+    };
+    t.after(() => fire('session_shutdown'));
+    const text = () => component.render(160).join('\n');
+    fire('session_start');
+    assert.match(text(), /high · fast · █/);
+    let previousRenders = renders;
+    await h.command('off');
+    assert.doesNotMatch(text(), / · fast · /);
+    assert.ok(renders > previousRenders);
+    previousRenders = renders;
+    await h.command('on');
+    assert.match(text(), /high · fast · /);
+    assert.ok(renders > previousRenders);
+    h.ctx.model.provider = 'custom';
+    fire('model_select');
+    assert.doesNotMatch(text(), / · fast · /);
+    h.ctx.model.provider = 'openai-codex';
+    h.ctx.model.id = 'another-future-model';
+    fire('model_select');
+    assert.match(text(), /high · fast · /);
+    // A failed save must not pretend to disable Fast in either component.
+    rmSync(path); mkdirSync(path);
+    await h.command('off');
+    assert.equal(last(h).level, 'error');
+    assert.match(text(), /high · fast · /);
+    fire('session_start'); // Invalid config fails closed and clears the marker.
+    assert.doesNotMatch(text(), / · fast · /);
+    fire('session_shutdown');
+    assert.equal(h.statuses.has('codex-fast'), false);
+  }
+});
+
 test('hook works without a TUI; warnings/errors/status use stderr when no UI exists', async t => {
   const messages = [];
   t.mock.method(console, 'error', message => messages.push(message));
@@ -317,6 +413,7 @@ test('hook works without a TUI; warnings/errors/status use stderr when no UI exi
     if (!hasUI) delete h.ctx.ui;
     h.start();
     assertOn(h);
+    assert.equal(h.statuses.size, 0);
     await h.command('status');
     if (hasUI) assert.match(last(h).message, /priority requested/);
     else assert.match(messages.at(-1), /priority requested/);

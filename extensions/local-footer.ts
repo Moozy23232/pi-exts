@@ -1,5 +1,5 @@
 /**
- * Personal footer: cwd, model, thinking, context and Git only (no cost/status chips).
+ * Personal footer: cwd, model, thinking, optional Codex fast request, context and Git.
  * Disable pi-cc-extensions' enableCustomFooter before loading this extension.
  * Git counts are paths, not changed lines: S staged, M modified, ? untracked, ! conflicts.
  */
@@ -101,6 +101,7 @@ export function renderFooter(
 	thinking: ReturnType<ExtensionAPI["getThinkingLevel"]>,
 	git: GitState,
 	theme: FooterTheme,
+	fastRequested: boolean = false,
 ): string[] {
 	if (width <= 0) return [];
 	const separator = theme.fg("dim", " · ");
@@ -133,6 +134,7 @@ export function renderFooter(
 		model?.reasoning
 			? theme.getThinkingBorderColor(thinking)(thinking)
 			: theme.fg("dim", "n/a"),
+		...(fastRequested && model?.provider === "openai-codex" ? [theme.fg("accent", "fast")] : []),
 		gauge + theme.fg("muted", ` ${contextLabel(usage, model?.contextWindow)}`),
 	];
 	return [...pack(location, width, separator), ...pack(details, width, separator)];
@@ -204,7 +206,10 @@ export default function (pi: ExtensionAPI) {
 			refresh();
 
 			return {
-				render: (width: number) => renderFooter(width, currentContext ?? ctx, pi.getThinkingLevel(), git, theme),
+				render: (width: number) => renderFooter(
+					width, currentContext ?? ctx, pi.getThinkingLevel(), git, theme,
+					footerData.getExtensionStatuses().get("codex-fast") === "fast",
+				),
 				invalidate() {}, // No themed strings or layout cached across renders.
 				dispose,
 			};

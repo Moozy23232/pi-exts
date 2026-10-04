@@ -43,22 +43,34 @@ const until = async predicate => {
 function harness(context) {
   const handlers = new Map();
   let component, renders = 0, unsubscribes = 0, level = 'high';
+  let statuses = new Map(), statusReads = 0;
+  const requestRender = () => renders++;
   const pi = { on: (event, handler) => handlers.set(event, handler), getThinkingLevel: () => level };
   context.mode ??= 'tui';
   context.hasUI ??= true;
-  context.ui = { setFooter: factory => {
-    component?.dispose();
-    component = factory({ requestRender: () => renders++ }, plainTheme, {
-      onBranchChange: () => () => unsubscribes++,
-    });
-  } };
+  context.ui = {
+    setStatus: (key, text) => {
+      statuses = new Map(statuses);
+      if (text === undefined) statuses.delete(key);
+      else statuses.set(key, text);
+      requestRender(); // Pi's host requests a render on every setStatus().
+    },
+    setFooter: factory => {
+      component?.dispose();
+      component = factory({ requestRender }, plainTheme, {
+        onBranchChange: () => () => unsubscribes++,
+        getExtensionStatuses: () => { statusReads++; return statuses; },
+      });
+    },
+  };
   footer.default(pi);
   return {
-    fire: event => handlers.get(event)?.({}, context),
+    fire: (event, eventContext = context) => handlers.get(event)?.({}, eventContext),
     lines: () => component?.render(160) ?? [],
     dispose: () => component?.dispose(),
     thinking: value => { level = value; },
     get renders() { return renders; },
+    get statusReads() { return statusReads; },
     get unsubscribes() { return unsubscribes; },
   };
 }
@@ -94,6 +106,67 @@ test('layout keeps fields, wraps narrow terminals, has no costs or session name'
   assert.match(footer.renderFooter(80, ctx({ model: { ...model, reasoning: false } }), 'high', { kind: 'none' }, plainTheme).join('\n'), / · n\/a · /);
   assert.doesNotMatch(text, /\p{Script=Han}/u);
   assert.doesNotMatch(footer.renderFooter(160, ctx(), 'high', { kind: 'error' }, plainTheme).join('\n'), /clean/);
+});
+
+test('fast chip is opt-in, provider-exact, model-ID independent, and accent highlighted', () => {
+  const codex = ctx({ model: { ...model, provider: 'openai-codex', id: 'arbitrary-future-model' } });
+  const render = (context, ...args) => footer.renderFooter(180, context, 'high', { kind: 'none' }, plainTheme, ...args).join('\n');
+  assert.doesNotMatch(render(codex), /\bfast\b/);
+  assert.doesNotMatch(render(codex, false), /\bfast\b/);
+  assert.match(render(codex, true), / · high · fast · █░{9}/);
+  assert.match(render(ctx({ model: { ...codex.model, reasoning: false } }), true), / · n\/a · fast · /);
+  for (const provider of ['example', 'openai', 'OpenAI-Codex', 'openai-codex-proxy', 'openai-codex ']) {
+    assert.doesNotMatch(render(ctx({ model: { ...model, provider } }), true), /\bfast\b/);
+  }
+  assert.doesNotMatch(render(ctx({ model: undefined }), true), /\bfast\b/);
+  const colors = [];
+  const theme = { ...plainTheme, fg: (color, text) => { colors.push([color, text]); return text; } };
+  footer.renderFooter(180, codex, 'high', { kind: 'none' }, theme, true);
+  assert.deepEqual(colors.filter(([, text]) => text === 'fast'), [['accent', 'fast']]);
+});
+
+test('fast-enabled layout fits widths 1..180 with long Unicode paths, branches and models', () => {
+  const context = ctx({
+    cwd: '/很长的目录/项目😀/e\u0301'.repeat(10),
+    model: { ...model, provider: 'openai-codex', name: '很长的模型😀e\u0301'.repeat(10) },
+  });
+  for (let width = 1; width <= 180; width++) {
+    const lines = footer.renderFooter(width, context, 'max', repoState({ branch: '很长的分支😀e\u0301'.repeat(10) }), ansiTheme, true);
+    assert.ok(lines.every(line => visibleWidth(line) <= width), `overflow at width=${width}`);
+    assert.ok(lines.every(line => !stripTerminalSequences(line).includes('\n')));
+    if (width >= 4) assert.match(lines.map(stripTerminalSequences).join('\n'), /\bfast\b/);
+  }
+});
+
+test('live status changes request rendering and are read fresh; provider switches guard stale status', async () => {
+  const dir = tempRepo();
+  const context = ctx({ cwd: dir, model: { ...model, provider: 'openai-codex', id: 'any-id' } });
+  const h = harness(context);
+  const text = () => h.lines().join('\n');
+  try {
+    h.fire('session_start');
+    await until(() => text().includes('clean'));
+    assert.doesNotMatch(text(), /\bfast\b/); // Standalone: no status publisher.
+    context.ui.setStatus('unrelated', 'fast');
+    assert.doesNotMatch(text(), /\bfast\b/);
+    for (const value of ['fast', undefined, 'off', 'FAST', '', 'fast', undefined, 'fast']) {
+      const renders = h.renders;
+      const reads = h.statusReads;
+      context.ui.setStatus('codex-fast', value);
+      assert.equal(h.renders, renders + 1);
+      assert.equal(/ · high · fast · /.test(text()), value === 'fast');
+      assert.equal(h.statusReads, reads + 1);
+    }
+    // Use fresh event contexts, not mutations of the context captured at startup.
+    for (const selectedModel of [{ ...model, provider: 'openai' }, undefined, context.model]) {
+      const renders = h.renders;
+      h.fire('model_select', { ...context, model: selectedModel });
+      assert.equal(h.renders, renders + 1);
+      assert.equal(/\bfast\b/.test(text()), selectedModel?.provider === 'openai-codex');
+    }
+    context.ui.setStatus('codex-fast', undefined);
+    assert.doesNotMatch(text(), /\bfast\b/);
+  } finally { h.dispose(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('10-cell context gauge preserves 80/95 thresholds, unknown, and over-limit usage', () => {
