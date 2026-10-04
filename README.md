@@ -7,6 +7,7 @@ Personal extensions for [Pi coding agent](https://pi.dev/).
 | Extension | Description |
 | --- | --- |
 | [Local footer](docs/local-footer.md) | Working directory, Git status, current model, thinking level and live context usage. No costs or session names. |
+| [Codex Fast](docs/codex-fast.md) | Standalone `/fast on\|off\|status` to request Codex priority tier. Off by default; no UI replacement. |
 
 ```text
 ~/work/demo · git main ↑1 ↓2 · S2 M1 ?3
@@ -16,15 +17,21 @@ example/Example Model · high · █░░░░░░░░░ 128k/1M (12.8%)
 ## Install
 
 Requires Pi and Node.js 22.19.0 or newer. Git must be on `PATH` for repository status.
-Tested with Pi 0.87.1.
+Tests use Pi 0.87.1 development dependencies; Codex Fast also loads with Pi 1.0.2.
 
 ```bash
-pi install git:github.com/Moozy23232/pi-exts@feat/local-footer
+pi install git:github.com/Moozy23232/pi-exts@feat/codex-fast
 ```
 
-The command selects the initial feature branch. To use the repository's default
-branch instead, omit `@feat/local-footer` once the extension is available there.
-Run `/reload` in an existing Pi session after installation.
+This branch includes both extensions. Omit `@feat/codex-fast` after it is merged
+into the default branch. Run `/reload` in an existing Pi session after installation.
+
+Existing installs filtered to `extensions/local-footer.ts` must also allow
+`extensions/codex-fast.ts` in the package's `extensions` list in settings.
+Codex Fast defaults to off. Use `/fast on` to opt in to priority requests with
+**higher credit usage**, and `/fast status` to inspect the setting. When replacing
+`open-tui-custom`, remove/disable that extension first to avoid duplicate `/fast`
+commands. See [Codex Fast](docs/codex-fast.md) for configuration and migration.
 
 ### Avoid duplicate footers
 
@@ -50,7 +57,7 @@ Keep only one custom footer enabled:
 ```bash
 git clone https://github.com/Moozy23232/pi-exts.git
 cd pi-exts
-git switch feat/local-footer
+git switch feat/codex-fast
 npm ci
 pi --no-extensions -e ./extensions/local-footer.ts
 ```
@@ -67,7 +74,7 @@ npm test
 
 Tests use local package dependencies, temporary Git repositories, and mocked Pi
 contexts. They do not require a globally installed `pi`, credentials, or model API
-calls. The extension itself remains a single file in `extensions/local-footer.ts`.
+calls. Each extension remains a standalone TypeScript file.
 
 Use [Conventional Commits](https://www.conventionalcommits.org/), for example:
 
@@ -79,7 +86,10 @@ fix(footer): handle detached HEAD
 ## Layout
 
 ```text
-extensions/local-footer.ts      # Single-file implementation
+extensions/local-footer.ts      # Footer implementation
+extensions/codex-fast.ts        # Standalone Codex priority toggle
 tests/local-footer.test.mjs     # Rendering, context, Git and lifecycle tests
-docs/local-footer.md            # Behavior and indicator reference
+tests/codex-fast.test.mjs        # Commands, persistence, payload and safety tests
+docs/local-footer.md            # Footer behavior and indicator reference
+docs/codex-fast.md              # Fast commands, configuration and safety
 ```

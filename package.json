@@ -13,7 +13,7 @@
     "node": ">=22.19.0"
   },
   "pi": {
-    "extensions": ["./extensions/local-footer.ts"]
+    "extensions": ["./extensions/local-footer.ts", "./extensions/codex-fast.ts"]
   },
   "files": ["extensions", "docs", "README.md"],
   "scripts": {
