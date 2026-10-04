@@ -21,6 +21,15 @@ example/Example Model · high · █░░░░░░░░░ 128k/1M (12.8%)
 - Model includes provider and display name; thinking follows Pi's current level.
   Only the level is shown (no `think` label); models without reasoning support
   show `n/a`.
+- Optional Codex integration: an accent-highlighted plain-text `fast` chip appears
+  after thinking and before the context gauge only when Pi's live extension status
+  `codex-fast` is exactly `fast` and the current model provider is exactly
+  `openai-codex`. There is no model-ID whitelist. `fast` means **priority requested**,
+  not server confirmation. Used standalone without the codex-fast extension, or
+  with absent/off status, another provider, or no model, the chip stays hidden.
+  Status is read fresh from `footerData.getExtensionStatuses()` on every render;
+  Pi's `setStatus()` requests rendering. No extra polling, configuration reads,
+  event bus, or dependency on the codex-fast module is needed.
 - Context shows the gauge and `used/limit (percent)` without a `ctx` label.
   It uses live `ctx.getContextUsage()`, not cumulative token usage. The numerator
   is Pi's estimate of the current context; the denominator is the currently
@@ -42,7 +51,7 @@ example/Example Model · high · █░░░░░░░░░ 128k/1M (12.8%)
 - Git refreshes on tool completion/branch changes and every 5 seconds for external
   changes. Checks are asynchronous, read-only (`--no-optional-locks`), bounded to
   3 seconds / 2 MiB output, and cancelled when the footer is disposed.
-- Labels are English, with no fee, session-name or third-party status chips.
+- Labels are English, with no fee, session-name or other extension status chips.
   No Nerd Font is required. Whole fields wrap on narrow terminals; an individual
   field wider than the terminal is truncated safely by visible columns.
 - In print/JSON/RPC mode, this extension does not install a footer or start Git polling.

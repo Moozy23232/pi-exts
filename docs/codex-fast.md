@@ -1,6 +1,6 @@
 # Codex Fast
 
-`extensions/codex-fast.ts` is a standalone Pi extension. It adds `/fast` and requests `service_tier: "priority"` on eligible provider payloads. It does not change the editor, header, footer, or status widgets, and does not make requests itself.
+`extensions/codex-fast.ts` is a standalone Pi extension. It adds `/fast` and requests `service_tier: "priority"` on eligible provider payloads. It does not replace the editor, header, or footer, and does not make requests itself. In TUI mode it publishes a `codex-fast` status that the local footer displays as a highlighted `fast` indicator.
 
 Load the file directly for one invocation:
 
@@ -18,19 +18,27 @@ Do not load it alongside another extension registering `/fast` (including the ol
 
 Arguments have completions and are case-insensitive. Invalid arguments show usage without changing state.
 
-“On” means **priority requested**, not confirmation that the server accepted priority or a guarantee of faster responses. Enabling applies to future eligible requests, not a request already in flight. The setting can be enabled while an unsupported model is selected; it applies after switching to a supported model.
+“On” means **priority requested**, not confirmation that the server accepted priority or a guarantee of faster responses. Enabling applies to future eligible requests, not a request already in flight. The setting can be enabled while another provider is selected; it applies after switching to `openai-codex`.
 
-## Exact model whitelist
+## Provider-only restriction
 
-Only the `openai-codex` provider qualifies, with these case-sensitive model IDs:
+Only the exact, case-sensitive provider ID `openai-codex` qualifies. **There is no model-ID or model-family whitelist.** New, renamed, and future models from that provider receive the same priority request without an extension update.
 
-- `gpt-5.4` (exact match)
-- `gpt-5.5` (exact match)
-- `gpt-5.6` or any ID beginning `gpt-5.6-`
-
-In particular, `gpt-5.4-mini`, `gpt-5.5-codex`, `gpt-5.60`, and the ordinary `openai` provider do not qualify. This deliberately preserves the old extension's whitelist rather than assuming future model support.
+The ordinary `openai` API provider, Azure, and differently named custom/proxy providers are not enabled by this extension. This is a provider-ID check, not verification of a custom provider's endpoint or a model's actual server-side priority support. An unsupported tier may be rejected or ignored by the server; use `/fast off` if necessary.
 
 For eligible requests, `before_provider_request` returns a shallow copy with `service_tier` set to `priority`, replacing any previous tier without mutating the original payload. Non-object and array payloads pass through unchanged. Disabled or unsupported requests are left alone, including any tier supplied by another extension or the provider.
+
+## Footer indicator
+
+With both this extension and `local-footer` enabled, the footer shows:
+
+```text
+openai-codex/Model · high · fast · █░░░░░░░░░ 100k/1M (10.0%)
+```
+
+`fast` is accent-highlighted and appears only while Fast is enabled and the selected provider is `openai-codex`. It means **priority requested**, not confirmed server acceptance. `/fast on`, `/fast off`, and provider changes refresh it immediately. Startup/reload restores the persisted state; shutdown clears the status. Failed saves keep the indicator consistent with the unchanged running setting.
+
+Integration uses `ctx.ui.setStatus('codex-fast', 'fast')` and the footer's live `getExtensionStatuses()` data, with no config polling or replacement UI. Each extension still works alone; the standard Pi footer can also display the published status. No status is published in print, JSON, or RPC mode.
 
 ## Configuration and safety
 
@@ -56,6 +64,6 @@ The request hook also works in non-TUI modes. Notifications use Pi's UI when ava
 
 ## Tests and attribution
 
-Run `node --test tests/codex-fast.test.mjs` (or the repository's `npm test`) after installing the repository's development dependencies. Tests load TypeScript through jiti, mock Pi, and use isolated temporary agent directories. They cover whitelist boundaries, immutable payloads, malformed config, atomic persistence, reload, failed saves, commands/completions, legacy-config isolation, and non-TUI behavior. No model or network calls are made.
+Run `node --test tests/codex-fast.test.mjs` (or the repository's `npm test`) after installing the repository's development dependencies. Tests load TypeScript through jiti, mock Pi, and use isolated temporary agent directories. They cover provider-only gating, arbitrary/future model IDs, immutable payloads, malformed config, atomic persistence, reload, failed saves, commands/completions, legacy-config isolation, non-TUI behavior, and live footer integration in either startup order. No model or network calls are made.
 
-The whitelist, payload helper, and command behavior were adapted from `open-tui-custom`. The original MIT license and `Copyright (c) 2026 pi-open-tui contributors` notice are preserved directly in `extensions/codex-fast.ts`, so the single-file extension carries its attribution when copied.
+The original provider/model gate, payload helper, and command behavior were adapted from `open-tui-custom`; the model whitelist has since been removed. The original MIT license and `Copyright (c) 2026 pi-open-tui contributors` notice are preserved directly in `extensions/codex-fast.ts`, so the single-file extension carries its attribution when copied.

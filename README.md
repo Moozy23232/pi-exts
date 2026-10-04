@@ -6,8 +6,8 @@ Personal extensions for [Pi coding agent](https://pi.dev/).
 
 | Extension | Description |
 | --- | --- |
-| [Local footer](docs/local-footer.md) | Working directory, Git status, current model, thinking level and live context usage. No costs or session names. |
-| [Codex Fast](docs/codex-fast.md) | Standalone `/fast on\|off\|status` to request Codex priority tier. Off by default; no UI replacement. |
+| [Local footer](docs/local-footer.md) | Working directory, Git status, model, thinking, live context and optional Fast indicator. No costs or session names. |
+| [Codex Fast](docs/codex-fast.md) | Standalone `/fast on\|off\|status` for all `openai-codex` models, with live footer status. Off by default; no UI replacement. |
 
 ```text
 ~/work/demo · git main ↑1 ↓2 · S2 M1 ?3
@@ -20,11 +20,12 @@ Requires Pi and Node.js 22.19.0 or newer. Git must be on `PATH` for repository s
 Tests use Pi 0.87.1 development dependencies; Codex Fast also loads with Pi 1.0.2.
 
 ```bash
-pi install git:github.com/Moozy23232/pi-exts@feat/codex-fast
+pi install git:github.com/Moozy23232/pi-exts@feat/codex-fast-provider-only
 ```
 
-This branch includes both extensions. Omit `@feat/codex-fast` after it is merged
-into the default branch. Run `/reload` in an existing Pi session after installation.
+This branch includes provider-only Fast gating and the live footer indicator.
+Omit `@feat/codex-fast-provider-only` after it is merged into the default branch.
+Run `/reload` in an existing Pi session after installation.
 
 Existing installs filtered to `extensions/local-footer.ts` must also allow
 `extensions/codex-fast.ts` in the package's `extensions` list in settings.
@@ -57,9 +58,9 @@ Keep only one custom footer enabled:
 ```bash
 git clone https://github.com/Moozy23232/pi-exts.git
 cd pi-exts
-git switch feat/codex-fast
+git switch feat/codex-fast-provider-only
 npm ci
-pi --no-extensions -e ./extensions/local-footer.ts
+pi --no-extensions -e ./extensions/local-footer.ts -e ./extensions/codex-fast.ts
 ```
 
 Pi loads the TypeScript file directly; no build step is required. Installing the

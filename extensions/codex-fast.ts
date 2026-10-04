@@ -25,10 +25,9 @@ import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync
 import { join } from 'node:path';
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 
-/** Preserve the original whitelist: 5.4/5.5 exact IDs, only 5.6 allows suffixes. */
-export function supportsCodexFast(provider: string | undefined, modelId: string | undefined): boolean {
-  return provider === 'openai-codex' && typeof modelId === 'string'
-    && (modelId === 'gpt-5.4' || modelId === 'gpt-5.5' || /^gpt-5\.6(?:$|-)/.test(modelId));
+/** Gate only on the official Codex provider; model IDs are intentionally unrestricted. */
+export function supportsCodexFast(provider: string | undefined): boolean {
+  return provider === 'openai-codex';
 }
 
 export function applyCodexFastTier<T>(payload: T): T {
@@ -80,12 +79,23 @@ export default function codexFast(pi: ExtensionAPI): void {
   const path = join(agentDir, 'codex-fast.json');
   let enabled = false;
 
+  const updateStatus = (ctx: ExtensionContext) => {
+    if (ctx.mode === 'tui' && ctx.hasUI) {
+      ctx.ui.setStatus('codex-fast', enabled && supportsCodexFast(ctx.model?.provider) ? 'fast' : undefined);
+    }
+  };
+
   pi.on('session_start', (_event, ctx) => {
     enabled = loadEnabled(path, ctx);
+    updateStatus(ctx);
+  });
+  pi.on('model_select', (_event, ctx) => updateStatus(ctx));
+  pi.on('session_shutdown', (_event, ctx) => {
+    if (ctx.mode === 'tui' && ctx.hasUI) ctx.ui.setStatus('codex-fast', undefined);
   });
 
   pi.on('before_provider_request', (event, ctx) => {
-    if (!enabled || !supportsCodexFast(ctx.model?.provider, ctx.model?.id)) return;
+    if (!enabled || !supportsCodexFast(ctx.model?.provider)) return;
     return applyCodexFastTier(event.payload);
   });
 
@@ -106,16 +116,17 @@ export default function codexFast(pi: ExtensionAPI): void {
           return;
         }
         enabled = nextEnabled;
+        updateStatus(ctx);
         notify(ctx, enabled
-          ? 'Codex Fast on: priority requested (service_tier=priority) for supported models; server acceptance is not guaranteed. Higher credit usage applies.'
+          ? 'Codex Fast on: priority requested (service_tier=priority) for all openai-codex models; server acceptance is not guaranteed. Higher credit usage applies.'
           : 'Codex Fast off: this extension will not request priority.', enabled ? 'warning' : 'info');
         return;
       }
       if (action === 'status') {
-        const supported = supportsCodexFast(ctx.model?.provider, ctx.model?.id);
+        const supported = supportsCodexFast(ctx.model?.provider);
         const applicability = supported
-          ? (enabled ? 'priority requested for the current model' : 'current model supports priority requests')
-          : 'current model is not supported; no priority requested';
+          ? (enabled ? 'priority requested for the current model (openai-codex; no model restrictions)' : 'current provider is openai-codex; no model restrictions')
+          : 'current provider is not openai-codex; no priority requested';
         notify(ctx, `Codex Fast: ${enabled ? 'on' : 'off'} (${applicability}). Server acceptance is not guaranteed.`, 'info');
         return;
       }
