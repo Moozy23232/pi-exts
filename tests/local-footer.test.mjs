@@ -2,11 +2,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { createJiti } from 'jiti';
 import { visibleWidth, stripTerminalSequences } from '@earendil-works/pi-tui';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 
 const jiti = createJiti(import.meta.url);
 const footer = await jiti.import('../extensions/local-footer.ts');
@@ -32,18 +33,20 @@ const tempRepo = () => {
 };
 
 // Poll only our own local asynchronous component, not external services.
+// Git refreshes are intentionally coalesced (>=5s) after a completed query.
 const until = async predicate => {
-  const end = Date.now() + 5000;
+  const end = Date.now() + 15000;
   while (!predicate()) {
     if (Date.now() > end) throw new Error('Footer did not refresh in time');
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 };
 
-function harness(context) {
+function harness(context, { branch = () => null } = {}) {
   const handlers = new Map();
   let component, renders = 0, unsubscribes = 0, level = 'high';
   let statuses = new Map(), statusReads = 0;
+  const branchListeners = new Set();
   const requestRender = () => renders++;
   const pi = { on: (event, handler) => handlers.set(event, handler), getThinkingLevel: () => level };
   context.mode ??= 'tui';
@@ -58,7 +61,11 @@ function harness(context) {
     setFooter: factory => {
       component?.dispose();
       component = factory({ requestRender }, plainTheme, {
-        onBranchChange: () => () => unsubscribes++,
+        onBranchChange: handler => {
+          branchListeners.add(handler);
+          return () => { branchListeners.delete(handler); unsubscribes++; };
+        },
+        getGitBranch: () => branch(),
         getExtensionStatuses: () => { statusReads++; return statuses; },
       });
     },
@@ -66,14 +73,56 @@ function harness(context) {
   footer.default(pi);
   return {
     fire: (event, eventContext = context) => handlers.get(event)?.({}, eventContext),
+    emit: (event, payload = {}, eventContext = context) => handlers.get(event)?.({ ...payload }, eventContext),
+    branchChanged: () => { for (const handler of [...branchListeners]) handler(); },
     lines: () => component?.render(160) ?? [],
     dispose: () => component?.dispose(),
     thinking: value => { level = value; },
     get renders() { return renders; },
     get statusReads() { return statusReads; },
     get unsubscribes() { return unsubscribes; },
+    get branchSubscriptions() { return branchListeners.size; },
   };
 }
+
+// The Jiti-loaded module may retain its execFile reference. Keep one dispatcher
+// for this test process and restore its real-Git path after every mocked test.
+const childProcess = createRequire(import.meta.url)('node:child_process');
+const realExecFile = childProcess.execFile;
+let gitQueryHandler = null;
+childProcess.execFile = (file, args, options, callback) => gitQueryHandler && file === 'git'
+  ? gitQueryHandler(file, args, options, callback)
+  : realExecFile(file, args, options, callback);
+syncBuiltinESMExports();
+
+// Deterministic stand-in for `git status`: the test answers each child itself.
+function mockGit(t) {
+  assert.equal(gitQueryHandler, null, 'previous Git mock was restored');
+  const calls = [];
+  const settle = (call, { stdout = '', stderr = '', error = null } = {}) => {
+    if (call.settled) return;
+    call.settled = true;
+    call.callback(error, stdout, stderr);
+  };
+  gitQueryHandler = (file, args, options, callback) => {
+    const call = { file, args, options, callback, aborted: false, settled: false };
+    calls.push(call);
+    options?.signal?.addEventListener?.('abort', () => {
+      call.aborted = true;
+      // Real execFile answers an aborted child with an AbortError.
+      queueMicrotask(() => settle(call, { error: Object.assign(new Error('aborted'), { name: 'AbortError' }) }));
+    }, { once: true });
+    return { pid: 4242, on() {}, kill() {} };
+  };
+  t.after(() => { gitQueryHandler = null; });
+  return { calls, reply: settle };
+}
+
+const CLOCK_START = 1_700_000_000_000; // Realistic epoch: cooldowns compare absolute times.
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const textOf = h => h.lines().join('\n');
+const porcelain = (branch = 'main', { ahead = 0, behind = 0, changes = '' } = {}) =>
+  `# branch.head ${branch}\0# branch.ab +${ahead} -${behind}\0${changes}`;
 
 test('context uses live occupancy, preserves unknown after compaction and zero', () => {
   assert.equal(footer.contextLabel({ tokens: 128000, contextWindow: 1e6, percent: 12.8 }), '128k/1M (12.8%)');
@@ -295,4 +344,228 @@ test('non-repository hides Git; shutdown during a pending child is safe; no foot
       noUi.fire('session_start'); assert.deepEqual(noUi.lines(), []);
     }
   } finally { h.dispose(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('branch hints paint immediately and never leak stats from another branch', () => {
+  const render = (git, hint) => footer.renderFooter(160, ctx(), 'high', git, plainTheme, false, hint).join('\n');
+  // Pi's cached branch arrives before the slower status query.
+  const pending = render({ kind: 'loading' }, 'feature');
+  assert.match(pending, /git feature status …/);
+  assert.doesNotMatch(pending, /\bclean\b/);
+  // Legacy six-argument calls keep their exact old output.
+  assert.equal(render(repoState()), footer.renderFooter(160, ctx(), 'high', repoState(), plainTheme, false).join('\n'));
+  assert.match(render(repoState()), /git main ↑1 ↓2 · S2 M1 \?3/);
+  // A hint for a different branch hides the previous branch's tracking and counts.
+  for (const git of [repoState(), { ...repoState(), stale: true }]) {
+    const text = render(git, 'feature');
+    assert.match(text, /git feature status (…|\?)/);
+    for (const leaked of ['↑1', '↓2', 'S2', 'M1', '?3', 'clean']) assert.ok(!text.includes(leaked), leaked);
+  }
+  // A failed refresh for the newly reported branch stays unknown.
+  assert.match(render({ ...repoState(), stale: true }, 'feature'), /git feature status \?/);
+  // Detached hints are compatible with the snapshot's @<sha>.
+  const detached = render({ kind: 'repo', status: { branch: '@abcdef1', ahead: 0, behind: 0, staged: 1, modified: 0, untracked: 0, conflicts: 0 } }, 'detached');
+  assert.match(detached, /git @abcdef1/);
+  assert.match(detached, /S1/);
+  assert.doesNotMatch(detached, /stale|status (…|\?)/);
+  // null/undefined mean "no hint"; control-only hints are dropped, never rendered.
+  assert.match(render(repoState(), null), /git main ↑1 ↓2/);
+  assert.match(render(repoState(), undefined), /git main ↑1 ↓2/);
+  assert.match(render({ kind: 'loading' }, null), /git …/);
+  assert.match(render({ kind: 'error' }, null), /git \?/);
+  const junk = render({ kind: 'loading' }, '\u001b[31m');
+  assert.doesNotMatch(junk.replaceAll('\n', ''), /[\x00-\x1f]/); // control-only hints never reach the terminal
+  assert.match(junk, /git /);
+});
+
+test('stale snapshots keep exact S/M/? counts but never claim clean', () => {
+  const render = (git, hint = 'main') => footer.renderFooter(160, ctx(), 'high', git, plainTheme, false, hint).join('\n');
+  const stale = render({ ...repoState(), stale: true });
+  assert.match(stale, /git main ↑1 ↓2/);
+  for (const kept of ['S2', 'M1', '?3']) assert.ok(stale.includes(kept), kept);
+  assert.match(stale, /\bstale\b/);
+  assert.doesNotMatch(stale, /\bclean\b/);
+  // The previous "clean" must not survive a failed refresh.
+  const cleanRepo = { kind: 'repo', status: { branch: 'main', ahead: 0, behind: 0, staged: 0, modified: 0, untracked: 0, conflicts: 0 } };
+  assert.match(render(cleanRepo), /\bclean\b/);
+  const staleClean = render({ ...cleanRepo, stale: true });
+  assert.match(staleClean, /git main/);
+  assert.doesNotMatch(staleClean, /\bclean\b/);
+  // Without a successful snapshot, failures stay unknown and never fabricate clean.
+  const failed = render({ kind: 'error' }, 'feature');
+  assert.match(failed, /git feature status \?/);
+  assert.doesNotMatch(failed, /clean|\bS\d|\bM\d|\?\d/);
+  assert.doesNotMatch(render({ kind: 'error' }), /clean/);
+  assert.doesNotMatch(render({ kind: 'none' }, null), /git/);
+});
+
+test('Git status reads start immediately, read-only tools only repaint, polling is 15s', async t => {
+  const { calls, reply } = mockGit(t);
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: CLOCK_START });
+  t.after(() => mock.timers.reset());
+  const branch = { value: 'main' };
+  const h = harness(ctx({ cwd: '/repo/one' }), { branch: () => branch.value });
+  try {
+    h.fire('session_start');
+    assert.equal(calls.length, 1); // first read is immediate
+    assert.equal(calls[0].file, 'git');
+    assert.deepEqual(calls[0].args, ['--no-optional-locks', '-C', '/repo/one', 'status', '--porcelain=v2', '--branch', '-z', '--untracked-files=normal']);
+    assert.equal(calls[0].options.timeout, 10000);
+    assert.match(textOf(h), /git main status …/); // hint does not wait for the status child
+    reply(calls[0], { stdout: porcelain('main', { ahead: 2, changes: '? a\0' }) });
+    await flush();
+    assert.match(textOf(h), /git main ↑2/);
+    assert.match(textOf(h), /\?1/);
+    for (const toolName of ['read', 'grep', 'find', 'ls']) {
+      const renders = h.renders;
+      h.emit('tool_execution_end', { toolName });
+      assert.ok(h.renders > renders, `${toolName} repaints`);
+      assert.equal(calls.length, 1, `${toolName} must not query Git`);
+    }
+    mock.timers.tick(9999);
+    await flush();
+    assert.equal(calls.length, 1);
+    mock.timers.tick(5001);
+    await flush();
+    assert.equal(calls.length, 2); // 15s external-change poll
+    assert.equal(calls[1].args[2], '/repo/one');
+  } finally { h.dispose(); }
+});
+
+test('tool/agent/branch bursts merge into one pending refresh with a 5s cooldown', async t => {
+  const { calls, reply } = mockGit(t);
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: CLOCK_START });
+  t.after(() => mock.timers.reset());
+  const branch = { value: 'main' };
+  const h = harness(ctx({ cwd: '/repo/burst' }), { branch: () => branch.value });
+  try {
+    h.fire('session_start');
+    reply(calls[0], { stdout: porcelain('main') });
+    await flush();
+    mock.timers.tick(5001); // cooldown after the initial query has elapsed
+    h.emit('tool_execution_end', { toolName: 'bash' });
+    assert.equal(calls.length, 2);
+    for (const [event, payload] of [['agent_end', {}], ['session_tree', {}], ['tool_execution_end', { toolName: 'edit' }]]) h.emit(event, payload);
+    h.branchChanged();
+    assert.equal(calls.length, 2); // all of them merged into one pending refresh
+    reply(calls[1], { stdout: porcelain('main', { changes: '? a\0' }) });
+    await flush();
+    assert.equal(calls.length, 2); // no back-to-back scanning
+    mock.timers.tick(4999);
+    await flush();
+    assert.equal(calls.length, 2);
+    mock.timers.tick(1);
+    await flush();
+    assert.equal(calls.length, 3);
+    reply(calls[2], { stdout: porcelain('main') });
+    await flush();
+    assert.match(textOf(h), /\bclean\b/);
+    mock.timers.tick(4000);
+    await flush();
+    assert.equal(calls.length, 3); // still inside the cooldown window
+    // A branch notification repaints at once and drops the old branch's stats.
+    branch.value = 'feature';
+    const renders = h.renders;
+    h.branchChanged();
+    assert.ok(h.renders > renders);
+    assert.match(textOf(h), /git feature status (…|\?)/);
+    assert.doesNotMatch(textOf(h), /git main|↑|↓|S\d|M\d|\?\d|\bclean\b/);
+  } finally { h.dispose(); }
+});
+
+test('failed refresh keeps the snapshot as stale, never stale-clean, then recovers', async t => {
+  const { calls, reply } = mockGit(t);
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: CLOCK_START });
+  t.after(() => mock.timers.reset());
+  const branch = { value: 'main' };
+  const h = harness(ctx({ cwd: '/repo/checkout' }), { branch: () => branch.value });
+  try {
+    h.fire('session_start');
+    reply(calls[0], { stdout: porcelain('main') });
+    await flush();
+    assert.match(textOf(h), /\bclean\b/);
+    mock.timers.tick(5001);
+    h.emit('tool_execution_end', { toolName: 'write' });
+    assert.equal(calls.length, 2);
+    // A transient HEAD lookup failure must not discard the last successful snapshot.
+    branch.value = null;
+    h.branchChanged();
+    assert.match(textOf(h), /git main/);
+    assert.match(textOf(h), /\bclean\b/);
+    reply(calls[1], { error: Object.assign(new Error('git failed'), { code: 128 }), stderr: 'fatal: unable to read' });
+    await flush();
+    assert.match(textOf(h), /git main/);
+    assert.doesNotMatch(textOf(h), /\bclean\b/); // the old clean is not current any more
+    assert.match(textOf(h), /\bstale\b/);
+    mock.timers.tick(5001);
+    h.emit('agent_end', {});
+    assert.equal(calls.length, 3);
+    reply(calls[2], { stdout: porcelain('main', { changes: '? a\0? b\0' }) });
+    await flush();
+    assert.match(textOf(h), /git main/);
+    assert.match(textOf(h), /\?2/);
+    assert.doesNotMatch(textOf(h), /\bstale\b/);
+  } finally { h.dispose(); }
+});
+
+test('cwd change drops the old snapshot and in-flight result instead of painting it', async t => {
+  const { calls, reply } = mockGit(t);
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: CLOCK_START });
+  t.after(() => mock.timers.reset());
+  const branch = { value: 'main' };
+  const context = ctx({ cwd: '/repo/old' });
+  const h = harness(context, { branch: () => branch.value });
+  try {
+    h.fire('session_start');
+    reply(calls[0], { stdout: porcelain('main', { changes: '? a\0? b\0? c\0' }) });
+    await flush();
+    assert.match(textOf(h), /\?3/);
+    mock.timers.tick(5001);
+    h.emit('tool_execution_end', { toolName: 'bash' });
+    assert.equal(calls.length, 2); // old directory has a real in-flight query
+    const oldCall = calls[1];
+    context.cwd = '/repo/new';
+    h.emit('tool_execution_end', { toolName: 'read' }); // even a read detects a new cwd
+    assert.equal(calls.length, 3);
+    assert.ok(oldCall.aborted);
+    const newCall = calls[2];
+    assert.equal(newCall.args[2], '/repo/new');
+    oldCall.callback(null, porcelain('main', { changes: '? x\0' }), '');
+    await flush();
+    // The old cwd's hint and snapshot must not be reused for the new directory.
+    assert.match(textOf(h), /git …/);
+    for (const leak of ['?3', '?1', 'git main', 'clean']) assert.ok(!textOf(h).includes(leak), leak);
+    reply(newCall, { stdout: porcelain('other') });
+    await flush();
+    assert.match(textOf(h), /git other/);
+    assert.match(textOf(h), /\bclean\b/);
+  } finally { h.dispose(); }
+});
+
+test('dispose stops polling, delayed refreshes, subscriptions and in-flight children', async t => {
+  const { calls } = mockGit(t);
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: CLOCK_START });
+  t.after(() => mock.timers.reset());
+  const h = harness(ctx({ cwd: '/repo/dispose' }));
+  try {
+    h.fire('session_start');
+    assert.equal(calls.length, 1);
+    assert.equal(h.branchSubscriptions, 1);
+    const renders = h.renders;
+    h.dispose();
+    assert.equal(h.unsubscribes, 1);
+    assert.equal(h.branchSubscriptions, 0);
+    assert.ok(calls[0].aborted, 'in-flight child aborted');
+    await flush(); // the aborted child answers late
+    assert.equal(h.renders, renders);
+    mock.timers.tick(120000);
+    await flush();
+    assert.equal(calls.length, 1);
+    h.emit('tool_execution_end', { toolName: 'bash' });
+    h.emit('agent_end', {});
+    h.branchChanged();
+    await flush();
+    assert.equal(calls.length, 1);
+    assert.equal(h.renders, renders);
+  } finally { h.dispose(); }
 });

@@ -21,7 +21,7 @@ export interface GitStatus {
 
 type GitState =
 	| { kind: "loading" | "none" | "error" }
-	| { kind: "repo"; status: GitStatus };
+	| { kind: "repo"; status: GitStatus; stale?: boolean };
 
 type FooterTheme = Pick<Theme, "fg" | "getThinkingBorderColor">;
 
@@ -102,23 +102,40 @@ export function renderFooter(
 	git: GitState,
 	theme: FooterTheme,
 	fastRequested: boolean = false,
+	// An unavailable branch hint is not proof that the directory is outside Git.
+	branchHint?: string | null,
 ): string[] {
 	if (width <= 0) return [];
 	const separator = theme.fg("dim", " · ");
+	const hint = branchHint == null ? undefined : safeText(branchHint) || undefined;
 	const location = [theme.fg("accent", displayPath(ctx.cwd, width))];
-	if (git.kind === "loading") location.push(theme.fg("dim", "git …"));
-	if (git.kind === "error") location.push(theme.fg("warning", "git ?"));
 	if (git.kind === "repo") {
 		const s = git.status;
-		const tracking = `${s.ahead ? ` ↑${s.ahead}` : ""}${s.behind ? ` ↓${s.behind}` : ""}`;
-		location.push(theme.fg("muted", `git ${safeText(s.branch) || "HEAD"}${tracking}`));
-		const changes = [
-			s.staged ? theme.fg("success", `S${s.staged}`) : "",
-			s.modified ? theme.fg("warning", `M${s.modified}`) : "",
-			s.untracked ? theme.fg("muted", `?${s.untracked}`) : "",
-			s.conflicts ? theme.fg("error", `!${s.conflicts}`) : "",
-		].filter(Boolean);
-		location.push(changes.length ? changes.join(" ") : theme.fg("success", "clean"));
+		const branch = safeText(s.branch) || "HEAD";
+		// A detached hint has no SHA; keep the snapshot's short SHA until refreshed.
+		const sameBranch = hint == null || (hint === "detached" ? s.branch.startsWith("@") : branch === hint);
+		if (!sameBranch) {
+			// Never show the previous branch's counts against the newly reported branch.
+			location.push(theme.fg(git.stale ? "warning" : "muted", `git ${hint} status ${git.stale ? "?" : "…"}`));
+		} else {
+			const tracking = `${s.ahead ? ` ↑${s.ahead}` : ""}${s.behind ? ` ↓${s.behind}` : ""}`;
+			location.push(theme.fg("muted", `git ${branch}${tracking}`));
+			const changes = [
+				s.staged ? theme.fg("success", `S${s.staged}`) : "",
+				s.modified ? theme.fg("warning", `M${s.modified}`) : "",
+				s.untracked ? theme.fg("muted", `?${s.untracked}`) : "",
+				s.conflicts ? theme.fg("error", `!${s.conflicts}`) : "",
+			].filter(Boolean);
+			if (changes.length) location.push(changes.join(" "));
+			// A stale snapshot cannot claim the working tree is currently clean.
+			else if (!git.stale) location.push(theme.fg("success", "clean"));
+			if (git.stale) location.push(theme.fg("warning", "stale"));
+		}
+	} else if (git.kind !== "none") {
+		if (hint !== undefined) {
+			location.push(theme.fg(git.kind === "error" ? "warning" : "muted", `git ${hint} status ${git.kind === "error" ? "?" : "…"}`));
+		} else if (git.kind === "loading") location.push(theme.fg("dim", "git …"));
+		else if (git.kind === "error") location.push(theme.fg("warning", "git ?"));
 	}
 	const model = ctx.model;
 	const usage = ctx.getContextUsage();
@@ -143,7 +160,7 @@ export function renderFooter(
 export default function (pi: ExtensionAPI) {
 	let currentContext: ExtensionContext | undefined;
 	let repaint: (() => void) | undefined;
-	let refreshGit: (() => void) | undefined;
+	let refreshGit: ((cwdOnly?: boolean) => void) | undefined;
 	let disposeFooter: (() => void) | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
@@ -151,49 +168,115 @@ export default function (pi: ExtensionAPI) {
 		currentContext = ctx;
 		if (ctx.mode !== "tui" || !ctx.hasUI) return;
 
+		const footerCwd = ctx.cwd;
+
 		ctx.ui.setFooter((tui, theme, footerData) => {
+			const POLL_MS = 15_000;
+			const COOLDOWN_MS = 5_000;
 			let git: GitState = { kind: "loading" };
 			let disposed = false;
 			let running = false;
 			let pending = false;
 			let controller: AbortController | undefined;
+			let generation = 0;
+			let delay: ReturnType<typeof setTimeout> | undefined;
 			let lastCwd = ctx.cwd;
+			let lastFinished = 0;
+			const currentCwd = () => currentContext?.cwd ?? ctx.cwd;
 			const requestRender = () => { if (!disposed) tui.requestRender(); };
+			// Pi caches this hint for the footer's own cwd; never reuse it for another directory.
+			const hint = () => currentCwd() === footerCwd ? footerData.getGitBranch?.() : undefined;
+			let lastBranchHint = hint();
 
-			const refresh = () => {
-				if (disposed) return;
-				if (running) { pending = true; return; }
+			const clearDelay = () => {
+				if (delay === undefined) return;
+				clearTimeout(delay);
+				delay = undefined;
+			};
+			const cancel = () => {
+				if (!running) return;
+				generation++;
+				controller?.abort();
+				controller = undefined;
+				running = false;
+			};
+			const syncCwd = () => {
+				const cwd = currentCwd();
+				if (cwd === lastCwd) return;
+				lastCwd = cwd;
+				git = { kind: "loading" };
+				pending = false;
+				lastFinished = 0; // A directory change bypasses the cooldown.
+				clearDelay();
+				cancel();
+				requestRender();
+			};
+			const schedule = (ms: number) => {
+				if (disposed || delay !== undefined) return;
+				delay = setTimeout(() => { delay = undefined; request(); }, ms);
+				delay.unref();
+			};
+			const start = () => {
+				if (disposed || running) return;
+				clearDelay();
 				running = true;
 				pending = false;
-				const cwd = currentContext?.cwd ?? ctx.cwd;
-				if (lastCwd !== cwd) { git = { kind: "loading" }; lastCwd = cwd; }
-				controller = new AbortController();
+				const cwd = currentCwd();
+				const id = ++generation;
+				const abort = new AbortController();
+				controller = abort;
 				execFile("git", ["--no-optional-locks", "-C", cwd, "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=normal"], {
-					encoding: "utf8", timeout: 3_000, maxBuffer: 2 * 1024 * 1024,
-					signal: controller.signal, env: { ...process.env, LC_ALL: "C" },
+					encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024,
+					signal: abort.signal, env: { ...process.env, LC_ALL: "C" },
 				}, (error, stdout, stderr) => {
+					if (disposed || id !== generation) return;
 					running = false;
 					controller = undefined;
-					if (disposed) return;
-					if (cwd === (currentContext?.cwd ?? ctx.cwd)) {
-						git = error
-							? { kind: /not a git repository/i.test(stderr) ? "none" : "error" }
-							: { kind: "repo", status: parseGitStatus(stdout) };
-						requestRender();
-					} else pending = true;
-					if (pending) refresh();
+					lastFinished = Date.now();
+					if (cwd !== currentCwd()) {
+						// Never publish a result from the previous directory; restart in the new one.
+						syncCwd();
+						start();
+						return;
+					}
+					if (!error) git = { kind: "repo", status: parseGitStatus(stdout) };
+					else if (/not a git repository/i.test(stderr)) git = { kind: "none" };
+					// Keep verified counts, but `clean` is no longer current.
+					else git = git.kind === "repo" ? { kind: "repo", status: git.status, stale: true } : { kind: "error" };
+					requestRender();
+					if (pending) { pending = false; schedule(COOLDOWN_MS); }
 				});
 			};
+			const request = (cwdOnly = false) => {
+				if (disposed || (cwdOnly && currentCwd() === lastCwd)) return;
+				syncCwd();
+				if (running) { pending = true; return; }
+				const wait = lastFinished + COOLDOWN_MS - Date.now();
+				if (wait > 0) schedule(wait);
+				else start();
+			};
 
-			const unsubscribe = footerData.onBranchChange(refresh);
-			const timer = setInterval(refresh, 5_000);
-			timer.unref();
+			const unsubscribe = footerData.onBranchChange(() => {
+				if (disposed) return;
+				// A missing hint can be a transient HEAD read failure, not a checkout.
+				const branch = hint();
+				if (branch && branch !== lastBranchHint) {
+					lastBranchHint = branch;
+					git = { kind: "loading" };
+					cancel(); // Do not publish a query started on the previous branch.
+				}
+				requestRender();
+				request();
+			});
+			const poll = setInterval(request, POLL_MS);
+			poll.unref();
 			const dispose = () => {
 				if (disposed) return;
 				disposed = true;
-				clearInterval(timer);
+				clearInterval(poll);
+				clearDelay();
 				unsubscribe();
-				controller?.abort();
+				cancel();
 				if (disposeFooter === dispose) {
 					disposeFooter = undefined;
 					refreshGit = undefined;
@@ -201,14 +284,15 @@ export default function (pi: ExtensionAPI) {
 				}
 			};
 			disposeFooter = dispose;
-			refreshGit = refresh;
+			refreshGit = request;
 			repaint = requestRender;
-			refresh();
+			request();
 
 			return {
 				render: (width: number) => renderFooter(
-					width, currentContext ?? ctx, pi.getThinkingLevel(), git, theme,
-					footerData.getExtensionStatuses().get("codex-fast") === "fast",
+					width, currentContext ?? ctx, pi.getThinkingLevel(),
+					currentCwd() === lastCwd ? git : { kind: "loading" }, theme,
+					footerData.getExtensionStatuses().get("codex-fast") === "fast", hint(),
 				),
 				invalidate() {}, // No themed strings or layout cached across renders.
 				dispose,
@@ -218,19 +302,26 @@ export default function (pi: ExtensionAPI) {
 
 	const update = (_event: unknown, ctx: ExtensionContext) => {
 		currentContext = ctx;
+		refreshGit?.(true);
 		repaint?.();
 	};
 	const updateGit = (_event: unknown, ctx: ExtensionContext) => {
-		update(_event, ctx);
+		currentContext = ctx;
 		refreshGit?.();
+		repaint?.();
 	};
+	const readOnlyTools = new Set(["read", "grep", "find", "ls"]);
 	pi.on("model_select", update);
 	pi.on("thinking_level_select", update);
 	pi.on("message_update", update);
 	pi.on("message_end", update);
 	pi.on("session_compact", update);
 	pi.on("session_tree", updateGit);
-	pi.on("tool_execution_end", updateGit);
+	pi.on("tool_execution_end", (event, ctx) => {
+		// Read-only tools repaint; a CWD change still needs its first Git snapshot.
+		if (readOnlyTools.has(event.toolName)) update(event, ctx);
+		else updateGit(event, ctx);
+	});
 	pi.on("agent_end", updateGit);
 	pi.on("session_shutdown", () => { disposeFooter?.(); currentContext = undefined; });
 }
