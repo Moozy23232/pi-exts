@@ -48,9 +48,28 @@ example/Example Model · high · █░░░░░░░░░ 128k/1M (12.8%)
   `clean` means no working-tree changes, not necessarily synced with the upstream.
   Detached HEAD shows `@<short SHA>`. Non-repositories omit Git; `git ?` means the
   status check failed/timed out, not that the tree is clean.
-- Git refreshes on tool completion/branch changes and every 5 seconds for external
-  changes. Checks are asynchronous, read-only (`--no-optional-locks`), bounded to
-  3 seconds / 2 MiB output, and cancelled when the footer is disposed.
+- The branch appears as soon as Pi's footer data knows it, without waiting for the
+  status check: a pending check shows `git <branch> status …`, and a failed one
+  shows `git <branch> status ?`. Until the status matches that branch, `↑`/`↓` and
+  `S`/`M`/`?`/`!`/`clean` from the previous branch stay hidden. Pi's hint is
+  `detached` for a detached HEAD; once the status arrives it shows the matching
+  `@<short SHA>`. A hint is only used for the directory the footer was created in.
+- If a check fails in the same directory and branch, the last verified counts stay
+  visible with a `stale` marker instead of `clean`; an unverified snapshot is never
+  reported as currently clean. A failure with no earlier snapshot stays `git ?`.
+  A confirmed branch change repaints immediately and invalidates the old branch's
+  snapshot. A temporarily unavailable branch hint does not discard verified counts.
+- The first Git query starts immediately. Working-tree tools (`bash`, `edit`,
+  `write`, …) and agent/session events request a refresh; read-only tools (`read`,
+  `grep`, `find`, `ls`) only repaint unless the CWD changed. Bursts coalesce into
+  one pending check, and
+  completion imposes a 5-second cooldown before the next check. External changes
+  are polled every 15 seconds. Checks are asynchronous, read-only
+  (`--no-optional-locks`, `git status --porcelain=v2`), bounded to 10 seconds /
+  2 MiB output, and cancelled when the footer is disposed.
+- A CWD change drops the old snapshot and cooldown immediately instead of showing
+  them in the new directory; a check still running for the old directory is
+  cancelled and its result ignored.
 - Labels are English, with no fee, session-name or other extension status chips.
   No Nerd Font is required. Whole fields wrap on narrow terminals; an individual
   field wider than the terminal is truncated safely by visible columns.

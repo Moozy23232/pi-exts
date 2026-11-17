@@ -365,7 +365,7 @@ test('Fast and local footer integrate in either startup order with live updates'
       component?.dispose();
       component = factory({ requestRender: () => renders++ }, {
         fg: (_color, text) => text, getThinkingBorderColor: () => text => text,
-      }, { onBranchChange: () => () => {}, getExtensionStatuses: () => h.statuses });
+      }, { onBranchChange: () => () => {}, getGitBranch: () => null, getExtensionStatuses: () => h.statuses });
     };
     footer.default({ on: (name, handler) => footerHandlers.set(name, handler), getThinkingLevel: () => 'high' });
     const fire = name => {
